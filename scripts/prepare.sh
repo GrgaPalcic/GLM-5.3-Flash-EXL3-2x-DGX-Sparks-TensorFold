@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# Prepare both Sparks to serve Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (with ABLIT=1, the gated
-# Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit, which needs HF_TOKEN) with TensorFold (two ranks; with TP=3, both
-# workers the same way, each per its own WORKER_WEIGHTS / WORKER_WEIGHTS2):
+# Prepare both Sparks to serve vcruz305/RED-SNOW-5.3-FLASH-EXL3-SAGE-4.91bpw (Blackfrost-AI's red-team finetune of
+# GLM-5.3-Flash) with our TensorFold fork (redsnow-homelab branch: the MiaAI-Lab patch series ported + the SAGE/EXL3
+# loader), two ranks:
 #   1. preflight checks: docker and the GPU on both nodes, key-based ssh to the worker, the RoCE link, disk space
-#   2. the image on the head: TensorFold plus patches/*.patch on NVIDIA's PyTorch container, pulled prebuilt from
-#      $GHCR_IMAGE when a matching tag is reachable (PULL=0 skips that), else built locally
+#   2. the image on the head: our TensorFold fork (git, TF_VERSION) on NVIDIA's PyTorch container, built locally
+#      (PULL=0 is the default here: nothing is published for this lane); patches/ stays empty, the fixes are in the fork
 #   3. the same image on the worker: pulled there, else streamed from the head (docker save | ssh docker load)
-#   4. download the checkpoint on the head into the Hugging Face cache (~164 GiB, resumable), and DFlash2 too when
+#   4. download the SAGE pack on the head into the Hugging Face cache (~199.5 GiB, resumable), DFlash2 too when
 #      DRAFTER=dflash2, at their pinned revisions (MODEL_REVISION, DFLASH2_REVISION)
-#   5. verify the checkpoint with `tensorfold info`
+#   4b. one shard of the BF16 source (Blackfrost-AI/RED-SNOW-5.3-FLASH-BF16) for the pack's 8-bit lm_head, which no
+#       TensorFold variant loads: HEAD_ID/HEAD_REV/HEAD_FILE/HEAD_SHA256 in scripts/config.sh
+#   4c. the serve view: the pack's files + the BF16 lm_head, built inside the image into hub/<SERVE_VIEW> — start.sh
+#       serves that, not the raw pack
+#   5. verify the serve view with `tensorfold info`
 #   6. the same files on the worker, copied from the head over the Sparks' link (rsync), checked file by file; or, with
 #      WORKER_WEIGHTS=nfs, a read-only NFS volume of the head's cache on the worker, checked the same way
+#   6b. the head shard and the serve view on the worker (the copy path; an NFS worker sees the head's cache)
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch.
 set -euo pipefail
@@ -243,13 +248,50 @@ for id in "${models[@]}"; do
   log "Checkpoint: $dir/snapshots/$rev ($(du -shL "$dir/snapshots/$rev" | cut -f1))"
 done
 
+# ---------------------------------------------------------------- 4b. the BF16 lm_head shard (head)
+# One file from the BF16 source repo, the exact revision the pack quantized: the serve view's sha256 check refuses
+# any other. Never download the whole BF16 repository (~1.2 TB) — a repo-level download here is a bug.
+head_dir=$(model_cache_dir "$HEAD_ID")
+head_rev=$(snapshot_rev "$HEAD_ID")
+head_snap="$head_dir/snapshots/${head_rev:-$HEAD_REV}"
+if [[ -f "$head_snap/$HEAD_FILE" ]]; then
+  log "BF16 head shard already at $head_snap/$HEAD_FILE"
+else
+  log "Downloading $HEAD_ID @ ${HEAD_REV:0:8} ($HEAD_FILE, one shard) into $HF_CACHE/hub"
+  if command -v hf >/dev/null; then
+    hf download "$HEAD_ID" "$HEAD_FILE" --revision "$HEAD_REV" --cache-dir "$HF_CACHE/hub" >/dev/null
+  else
+    docker run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
+      -v "$HF_CACHE":/hf -e HF_HOME=/hf -e HOME=/tmp "$IMAGE" -c \
+      'import sys; from huggingface_hub import hf_hub_download; hf_hub_download(sys.argv[1], sys.argv[2], revision=sys.argv[3])' \
+      "$HEAD_ID" "$HEAD_FILE" "$HEAD_REV"
+  fi
+  [[ -n "$head_rev" ]] || { mkdir -p "$head_dir/refs"; printf %s "$HEAD_REV" > "$head_dir/refs/main"; }
+  head_rev=$(snapshot_rev "$HEAD_ID"); head_snap="$head_dir/snapshots/${head_rev:-$HEAD_REV}"
+  [[ -f "$head_snap/$HEAD_FILE" ]] || die "$HEAD_ID: $HEAD_FILE not in the cache after the download"
+fi
+
+# ---------------------------------------------------------------- 4c. the serve view (head)
+# The pack's files with the BF16 lm_head in place, built INSIDE the image so every symlink target is a container path
+# (/root/.cache/huggingface/...): the same view then works on any Spark that mounts its cache there, rank 1 included.
+# tools/serve_view.py is this recipe's copy of the fork's (kept beside the recipe; the image packages the library only).
+view="/root/.cache/huggingface/hub/$SERVE_VIEW"
+pack="/root/.cache/huggingface/hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev "$MODEL_ID")"
+head="/root/.cache/huggingface/hub/models--${HEAD_ID//\//--}/snapshots/$HEAD_REV/$HEAD_FILE"
+if docker run --rm --entrypoint python -e HF_HUB_OFFLINE=1 \
+     -v "$HF_CACHE":/root/.cache/huggingface -v "$PWD/tools":/tools "$IMAGE" \
+     /tools/serve_view.py --pack "$pack" --head "$head" --out "$view" --expect-head-sha256 "$HEAD_SHA256" >/dev/null; then
+  log "Serve view: $HF_CACHE/hub/$SERVE_VIEW ($(du -shL "$HF_CACHE/hub/$SERVE_VIEW" | cut -f1), links + one head file)"
+else
+  die "the serve view failed (the head shard's sha256, the pack's index or the disk may be wrong)"
+fi
+
 # ---------------------------------------------------------------- 5. verify (head)
-# before the copy: the worker gets only a checkpoint TensorFold reads
-log "Verifying checkpoint with tensorfold info"
-# (without its "EXL3 support is experimental" note: this recipe serves the EXL3 checkpoint on purpose)
+# before the copy: the worker gets only a checkpoint TensorFold reads. Verify the serve view — it is what start.sh
+# serves, and the raw pack's 8-bit lm_head group is not loadable by design.
+log "Verifying the serve view with tensorfold info"
 info=$(docker run --rm --entrypoint tensorfold -e HF_HUB_OFFLINE=1 -v "$HF_CACHE":/root/.cache/huggingface "$IMAGE" \
-  info "/root/.cache/huggingface/hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev "$MODEL_ID")" 2>&1) ||
-  die "tensorfold info cannot read the checkpoint: $info"
+  info "$view" 2>&1) || die "tensorfold info cannot read the serve view: $info"
 printf '%s\n' "$info" | grep -v "EXL3 support is experimental" || true
 
 # ---------------------------------------------------------------- 6. the same files on the workers
@@ -319,6 +361,34 @@ for id in "${models[@]}"; do
   [[ "$have" == "$manifest" ]] ||
     { manifest_diff "$manifest" "$have"; die "$w's copy of $id differs from the head's after the copy"; }
 done
+done
+
+# ---------------------------------------------------------------- 6b. the head shard and the serve view on the workers
+# The head shard rides with the pack (one file, rsync dereferences it into a real file); then the worker builds the
+# same view in its own image — the symlink targets are container paths, identical on every Spark. A worker that reads
+# the head's cache over NFS already has both (it sees the head's cache through the mount).
+head_wdir="hub/${head_dir##*/}"
+view_host="hub/$SERVE_VIEW"
+for i in $(worker_ids); do
+  [[ "$(worker_weights "$i")" == nfs ]] && continue
+  w=$(wname "$i"); WHOST=$(worker_host "$i"); WHF=${WORKER_HF[i]}
+  if [[ "$(worker "$i" "test -f '$WHF/$head_wdir/snapshots/$HEAD_REV/$HEAD_FILE' && echo y")" != y ]]; then
+    log "Copying the BF16 head shard to $w (~$(stat -Lc %s "$head_snap/$HEAD_FILE" | awk '{printf "%d", ($1 + 2^30 - 1) / 2^30}') GB)"
+    worker "$i" "mkdir -p '$WHF/$head_wdir/snapshots/$HEAD_REV'"
+    rsync -a -L --partial "$head_snap/$HEAD_FILE" "$WHOST:$WHF/$head_wdir/snapshots/$HEAD_REV/" -e "ssh -o BatchMode=yes"
+    [[ "$(worker "$i" "test -f '$WHF/$head_wdir/snapshots/$HEAD_REV/$HEAD_FILE' && echo y")" == y ]] ||
+      die "$w: the head shard did not arrive"
+  else
+    log "Worker has the BF16 head shard"
+  fi
+  if [[ "$(worker "$i" "test -f '$WHF/$view_host/model.safetensors.index.json' && echo y")" != y ]]; then
+    log "Building the serve view on $w"
+    worker "$i" "cat > /tmp/redsnow-serve-view.py" < tools/serve_view.py
+    worker "$i" "docker run --rm --entrypoint python -e HF_HUB_OFFLINE=1 -v '$WHF':/root/.cache/huggingface -v /tmp:/tools $IMAGE /tools/redsnow-serve-view.py --pack '/root/.cache/huggingface/hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev "$MODEL_ID")' --head '/root/.cache/huggingface/$head_wdir/snapshots/$HEAD_REV/$HEAD_FILE' --out '/root/.cache/huggingface/$view_host' --expect-head-sha256 '$HEAD_SHA256'" \
+      < /dev/null || die "$w: the serve view failed"
+  else
+    log "Worker has the serve view"
+  fi
 done
 
 prepared_state > "$PREPARED_MARKER"

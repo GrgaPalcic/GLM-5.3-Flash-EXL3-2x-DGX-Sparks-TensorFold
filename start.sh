@@ -216,10 +216,35 @@ snapshot() {  # <repo id>: its snapshot path in the container, checked on every 
   done
   echo "/root/.cache/huggingface/$sub"
 }
-MODEL_ARG=$(snapshot "$MODEL_ID")
+# The serve view (prepare.sh 4c): the pack with the BF16 lm_head in place, under the cache as hub/<SERVE_VIEW>.
+# Served instead of the raw pack when present on a Spark (the raw pack's 8-bit lm_head group is not loadable); the
+# same checks as snapshot(): config.json on the head and on every worker's cache.
+serve_view_arg() {
+  local sub="hub/$SERVE_VIEW" i
+  [[ -f "$HF_CACHE/$sub/model.safetensors.index.json" ]] ||
+    die "no serve view in $HF_CACHE (hub/$SERVE_VIEW): run PULL=0 scripts/prepare.sh first"
+  for i in $(worker_ids); do
+    (( DRY )) && break
+    if [[ "$(worker_weights "$i")" == nfs ]]; then
+      worker_nfs "$i" test -f "/hf/$sub/model.safetensors.index.json" ||
+        die "$(wname "$i") does not see the serve view over NFS ($NFS_VOLUME): build it there or re-run prepare.sh"
+    else
+      worker "$i" "test -f '${WORKER_HF[i]}/$sub/model.safetensors.index.json'" ||
+        die "the serve view is missing on $(wname "$i") (${WORKER_HF[i]}): re-run prepare.sh"
+    fi
+  done
+  echo "/root/.cache/huggingface/$sub"
+}
+if [[ -f "$HF_CACHE/hub/$SERVE_VIEW/model.safetensors.index.json" ]]; then
+  MODEL_ARG=$(serve_view_arg)
+else
+  MODEL_ARG=$(snapshot "$MODEL_ID")
+fi
 if [[ "$DRAFTER" == dflash2 ]]; then DRAFTER_ARG=$(snapshot "$DFLASH2_ID")
 else DRAFTER_ARG=none; fi                           # the checkpoint's MTP head, even when DFlash2 is downloaded
-SERVE_ARGS=(--drafter "$DRAFTER_ARG" "${SERVE_ARGS[@]}")   # a --drafter on the command line comes later and wins
+# KV dtype: this lane's fork is TensorFold 0.6.5-based, whose --kv-dtype flag replaces the TF_GLM_KV env the 0.6.0
+# patches read; without the flag the engine silently serves a bf16 cache and the pool halves. Values match: bf16|fp8.
+SERVE_ARGS=(--drafter "$DRAFTER_ARG" --kv-dtype "$KV" "${SERVE_ARGS[@]}")   # a later --drafter/--kv-dtype wins
 
 # ---------------------------------------------------------------- 2. checks
 step 2 "Checks: arguments, link, previous server, port, memory"

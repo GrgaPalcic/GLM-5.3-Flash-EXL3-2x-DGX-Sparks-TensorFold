@@ -54,22 +54,38 @@ SOCKET_IFNAME="${SOCKET_IFNAME:-}"
 # (~176 GB). With ABLIT=1, THINKING defaults to 0 (below).
 ABLIT="${ABLIT:-0}"
 ABLIT_ID="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit"
-_id="Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold"; [[ "$ABLIT" == 1 ]] && _id=$ABLIT_ID
-MODEL_ID="${MODEL_ID:-$_id}"   # EXL3 routed experts (4 bpw), BF16 elsewhere
+# RED-SNOW-5.3-FLASH: Blackfrost-AI's red-team finetune of GLM-5.3-Flash, vcruz305's EXL3 SAGE 4.91 bpw pack
+# (MixedK, 199.5 GB, 36 shards, MIT, not gated). The pack stores an 8-bit lm_head group no TensorFold variant
+# loads: prepare.sh builds a serve view (the pack's files + the BF16 source's lm_head.weight) and start.sh
+# serves that. ABLIT=1 would serve Mia's Ablit weights instead; that combination is unsupported on this lane
+# (the serve view is built for this pack only) — leave ABLIT=0.
+RED_SNOW_ID="vcruz305/RED-SNOW-5.3-FLASH-EXL3-SAGE-4.91bpw"
+_id="$RED_SNOW_ID"; [[ "$ABLIT" == 1 ]] && _id=$ABLIT_ID
+MODEL_ID="${MODEL_ID:-$_id}"
 # The checkpoint's revision (a Hugging Face commit sha; DFLASH2_REVISION below is DFlash2's): the one this recipe was
 # measured with. prepare.sh downloads exactly it, start.sh serves that snapshot from the local cache (no network), and
 # a new upstream commit changes nothing here until the pin does. Empty: the Hub's main when first downloaded. The pins
 # belong to the checkpoints above; another MODEL_ID gets no pin unless you set one.
 case "$MODEL_ID" in
+  vcruz305/RED-SNOW-5.3-FLASH-EXL3-SAGE-4.91bpw) _rev=f6b8963784254095a54944f2963b2925fcf4b199 ;;
   Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) _rev=078455ffe6472f9a52fbc1139f58b9db2881b25c ;;
   Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold-Ablit) _rev=57edefd2f5d9b371c8345883304d5af68b52fa24 ;;
   *) _rev="" ;;
 esac
 MODEL_REVISION="${MODEL_REVISION-$_rev}"
-TF_VERSION="${TF_VERSION:-v0.6.0}"
-TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
+# The BF16 source's lm_head shard the serve view swaps in: pinned file + sha256, from the exact revision the pack
+# quantized (the pins are justincasey's redsnow.sh's; a wrong revision fails the view's digest check before any load).
+HEAD_ID="${HEAD_ID:-Blackfrost-AI/RED-SNOW-5.3-FLASH-BF16}"
+HEAD_REV="${HEAD_REV:-c0a7b6e3309db18e71f9c390e225594feebecafc}"
+HEAD_FILE="${HEAD_FILE:-model-00001-of-00120.safetensors}"
+HEAD_SHA256="${HEAD_SHA256:-730c19fa750f46a3803a478ac7e698af21431e8426c40417bc8a2136be377371}"
+# TF_VERSION here is our fork's git ref (a branch or commit): this lane's patches live IN the fork's source, so
+# patches/ stays empty and the image is built locally (PULL=0) — nothing is published for it. The pin below is the
+# commit this lane's guide was written against; bump it after rebasing the fork.
+TF_VERSION="${TF_VERSION:-redsnow-homelab}"
+TF_REPO="${TF_REPO:-https://github.com/GrgaPalcic/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
-IMAGE="${IMAGE:-tensorfold-glm53:${TF_VERSION}}"
+IMAGE="${IMAGE:-tensorfold-redsnow:${TF_VERSION}}"
 # pip packages the image adds on top of TensorFold (av: video input; xgrammar: response_format / structured outputs);
 # they are part of the image's hash, so a change rebuilds it like a patch does
 IMAGE_EXTRAS="av==18.1.0 xgrammar>=0.2.8,<0.3"
@@ -86,9 +102,9 @@ prebuilt_image() {
   local tag="${TF_VERSION}-$(image_hash)"
   if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
 }
-CONTAINER_NAME="${CONTAINER_NAME:-glm53-flash-tf}"           # the same name on both Sparks
+CONTAINER_NAME="${CONTAINER_NAME:-redsnow53-flash-tf}"        # the same name on both Sparks
 
-SERVED_NAME="${SERVED_NAME:-GLM-5.3-Flash-EXL3}"
+SERVED_NAME="${SERVED_NAME:-RED-SNOW-5.3-Flash}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 DRAFTER="${DRAFTER:-dflash2}"        # dflash2: incoai/GLM-5.3-Flash-DFlash2 drafts (CC BY-NC-ND 4.0: non-commercial
@@ -106,7 +122,7 @@ VISION_URLS="${VISION_URLS:-0}"
 # sparkDash aggregate decode at 4 / 8 requests at once: two Sparks prose 103.2 / 130.8 tok/s, code 126.7 / 167.0; three
 # Sparks prose 121.8 / 166.0, code 165.3 / 211.5. One request alone decodes as fast either way. The memory reserve
 # grows with PARALLEL (below), so the shared pool shrinks: two Sparks ~1.5M tokens at 8 (2.0-2.6M at 4), three ~4M.
-if [[ "$DRAFTER" != dflash2 ]]; then _par=1; elif [[ "${TP:-2}" == 3 ]]; then _par=8; else _par=4; fi
+if [[ "$DRAFTER" != dflash2 ]]; then _par=1; elif [[ "${TP:-2}" == 3 ]]; then _par=8; else _par=1; fi
 PARALLEL="${PARALLEL:-$_par}"
 # The DSA latent cache and the indexer's pooled keys (patch 0038): fp8 (default) holds them as e4m3 rows with a
 # power-of-two scale each, half bf16's bytes: the 1M-token window with 4 streams fits (rank 0: 88.09 GiB estimated,
@@ -114,9 +130,10 @@ PARALLEL="${PARALLEL:-$_par}"
 # ones. bf16: the exact cache (~196k tokens with DFlash2).
 KV="${KV:-fp8}"
 export TF_GLM_KV="$KV"
-# Prompt + reply window. With KV=fp8: 1,048,576 (the checkpoint's native window). With KV=bf16: 196,608 with DFlash2
-# (163,840 with VISION=1 and DENSE=fp8 or bf16: the tower costs rank 0 ~66k tokens of window, which q4's smaller
-# weights give back), 524,288 with mtp. start.sh falls back to the largest that fits when a start's memory budget is
+# Prompt + reply window: 1,048,576 (the pack's native 1M) — phase 1 serves ONE stream, and the fork's glm5_next
+# engine is single-request: a second request waits (kept-prompt snapshots make the switch-back ~instant). The
+# multi-stream port (Mia's 0026/0029/0030/0035) is phase 2; then drop this to 614400 and raise PARALLEL to 2.
+# With KV=bf16: 196,608 with DFlash2. start.sh falls back to the largest that fits when a start's memory budget is
 # smaller. 0: the largest the memory affords (then no memory is left to keep other conversations' prompts).
 DENSE="${DENSE:-q4}"
 if [[ "$KV" != bf16 ]]; then _ctx=1048576; elif [[ "$DRAFTER" != dflash2 ]]; then _ctx=524288
@@ -309,7 +326,11 @@ export TF_GLM_SHARED_PREFIX="$SHARED_PREFIX"
 # where PARALLEL=4 has it; the pool shrinks instead.
 _extra=$(awk -v p="$PARALLEL" -v w="${TF_GLM_MULTI_WINDOW:-32}" 'BEGIN { e = 0; if (p > 4) e += 0.95 * (p - 4);
   if (w > 32) e += 0.04 * (w - 32); printf "%.1f", e }')
-MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-$(awk -v e="$_extra" 'BEGIN { printf "%.1f", 14.5 + e }')}"
+# Base reserve 12, not Mia's 14.5: this lane runs PARALLEL=1 (their default 4), but fills are 1M tokens (their
+# measured ~10 GiB overshoot past the estimate was on a 1M fill) and the SAGE pack's weights take ~9 GiB a rank more
+# than Mia's 4 bpw pack. 12 leaves ~2-4 GiB lowest free memory on a 1M fill.
+# Do not go below 4: a Spark that runs out of unified memory mid-fill freezes (homelab 4-inference/glm53 Footguns).
+MEMORY_RESERVE_GIB="${MEMORY_RESERVE_GIB:-$(awk -v e="$_extra" 'BEGIN { printf "%.1f", 12 + e }')}"
 export TENSORFOLD_MEMORY_RESERVE_GIB="$MEMORY_RESERVE_GIB"
 # With more Sparks each holds fewer weights, so the pool can take more (the per-token KV cost is the same on every
 # rank: the latent cache is replicated). TP=3: 32 GiB leaves rank 0, the busiest, ~5 GiB under a 1M-token prompt
@@ -359,7 +380,7 @@ LOG_KEEP="${LOG_KEEP:-10}"
 # checkpoint (~176 GB) when that list cannot be read (no huggingface_hub on the host, or no network); on each worker,
 # what rsync must send plus 5 GB; and an image build or copy (~25 GB) under Docker's root on each Spark; both together
 # when they share a filesystem.
-MIN_FREE_GB="${MIN_FREE_GB:-180}"
+MIN_FREE_GB="${MIN_FREE_GB:-220}"   # the SAGE pack is 199.5 GB (the 4 bpw pack was 164) + the BF16 head shard
 IMAGE_FREE_GB="${IMAGE_FREE_GB:-35}"
 
 # Colours only on a terminal.
@@ -382,7 +403,11 @@ need_hf_token() {
 }
 model_cache_dir() { local id=${1:-$MODEL_ID}; echo "$HF_CACHE/hub/models--${id//\//--}"; }
 # model_revision <id>: the pinned revision of MODEL_ID or DFLASH2_ID (empty: none, the cache's refs/main counts)
-model_revision() { if [[ "$1" == "$MODEL_ID" ]]; then echo "$MODEL_REVISION"; elif [[ "$1" == "$DFLASH2_ID" ]]; then echo "$DFLASH2_REVISION"; fi; }
+model_revision() { if [[ "$1" == "$MODEL_ID" ]]; then echo "$MODEL_REVISION"; elif [[ "$1" == "$DFLASH2_ID" ]]; then echo "$DFLASH2_REVISION"; elif [[ "$1" == "$HEAD_ID" ]]; then echo "$HEAD_REV"; fi; }
+# SERVE_VIEW: the directory under the HF cache (a path inside the containers' cache mount) that holds the pack's files
+# with the BF16 lm_head in place; prepare.sh builds it in-container, start.sh serves it. The name is fixed so a start
+# finds what a prepare built.
+SERVE_VIEW="${SERVE_VIEW:-redsnow-serve-view}"
 # snapshot_rev <id>: the snapshot this setup serves: the pin, else what refs/main names on this Spark
 snapshot_rev() { local rev; rev=$(model_revision "$1"); [[ -n "$rev" ]] || rev=$(cat "$(model_cache_dir "$1")/refs/main" 2>/dev/null); echo "$rev"; }
 
@@ -396,7 +421,7 @@ prepared_state() {
   hash=$(image_hash)
   label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   wlabel=$(worker 1 docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
-  line="model=$MODEL_ID@$MODEL_REVISION drafter=$DRAFTER@$DFLASH2_REVISION image=$label worker=$wlabel patches=$hash worker_host=$WORKER weights=$WORKER_WEIGHTS"
+  line="model=$MODEL_ID@$MODEL_REVISION drafter=$DRAFTER@$DFLASH2_REVISION image=$label worker=$wlabel patches=$hash worker_host=$WORKER weights=$WORKER_WEIGHTS head=$HEAD_ID@$HEAD_REV view=$SERVE_VIEW"
   for (( i = 2; i < TP; i++ )); do
     wlabel=$(worker "$i" docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
     line+=" worker$i=$wlabel worker${i}_host=$(worker_host "$i") weights$i=$(worker_weights "$i") nfs$i=$(wval NFS_SERVER "$i")"
